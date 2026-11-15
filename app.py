@@ -1,4 +1,4 @@
-"""Text Summarizer: Streamlit + Gemini, with logging, rate limiting and a usage report."""
+"""Text Summarizer: Streamlit + Claude, with logging, rate limiting and a usage report."""
 
 import json
 import os
@@ -7,18 +7,18 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import streamlit as st
-from google import genai
-from google.genai import types
+import anthropic
 
 # ---------- Configuration (everything comes from environment variables) ----------
-API_KEY = os.environ.get("GEMINI_API_KEY", "")
-MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.8-flash")
+API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
+MODEL = os.environ.get("CLAUDE_MODEL", "claude-opus-5-5")
+EFFORT = os.environ.get("CLAUDE_EFFORT", "low")  # low | medium | high: lower is faster and cheaper
 RATE_LIMIT = int(os.environ.get("RATE_LIMIT_PER_HOUR", "5"))  # requests per user per hour
-TIMEOUT_MS = int(os.environ.get("REQUEST_TIMEOUT_MS", "120000"))
+TIMEOUT_SECONDS = float(os.environ.get("REQUEST_TIMEOUT_SECONDS", "60"))
 MAX_INPUT_CHARS = 20_000
-# Estimated price in USD per 1 million tokens (adjust to match your model's pricing page).
-PRICE_IN = float(os.environ.get("PRICE_INPUT_PER_M", "0.30"))
-PRICE_OUT = float(os.environ.get("PRICE_OUTPUT_PER_M", "2.50"))
+# Price in USD per 1 million tokens. Defaults match claude-opus-5-5; change them if you change the model.
+PRICE_IN = float(os.environ.get("PRICE_INPUT_PER_M", "4.00"))
+PRICE_OUT = float(os.environ.get("PRICE_OUTPUT_PER_M", "20.00"))
 
 LOG_FILE = Path(__file__).parent / "logs" / "requests.jsonl"
 WINDOW_SECONDS = 3600
@@ -58,35 +58,40 @@ def check_rate_limit(user: str) -> tuple[bool, int]:
 
 # ---------- The LLM call ----------
 def summarize(text: str, style: str, failure_mode: str):
-    api_key, timeout = API_KEY, TIMEOUT_MS
+    api_key, timeout, retries = API_KEY, TIMEOUT_SECONDS, 1
     if failure_mode == "Revoked API key":
-        api_key = "invalid-key-for-demo"
+        api_key = "sk-ant-invalid-key-for-demo"
     elif failure_mode == "Timeout":
-        timeout = 1  # 1 ms: guaranteed to time out
-    client = genai.Client(api_key=api_key, http_options=types.HttpOptions(timeout=timeout))
-    # Streaming keeps the connection active while the model works, which avoids
-    # most 504 DEADLINE_EXCEEDED errors on slower models.
-    text_parts, usage = [], None
-    for chunk in client.models.generate_content_stream(
+        timeout, retries = 0.001, 0  # 1 ms: guaranteed to time out
+    client = anthropic.Anthropic(api_key=api_key, timeout=timeout, max_retries=retries)
+    return client.beta.messages.create(
         model=MODEL,
-        contents=f"Summarize the following text as {style}.\n\n---\n{text}",
-    ):
-        if chunk.text:
-            text_parts.append(chunk.text)
-        if chunk.usage_metadata:
-            usage = chunk.usage_metadata
-    return "".join(text_parts), usage
+        max_tokens=16000,
+        output_config={"effort": EFFORT},
+        # If the model declines a request, the API retries it on a fallback model.
+        betas=["server-side-fallback-2026-07-01"],
+        fallbacks="default",
+        system="You summarize text. Reply with only the summary, in the requested style.",
+        messages=[{"role": "user", "content": f"Summarize the following text as {style}.\n\n---\n{text}"}],
+    )
 
 
 def friendly_error(exc: Exception) -> str:
-    name, msg = type(exc).__name__.lower(), str(exc).lower()
-    if "timeout" in name or "timed out" in msg or "timeout" in msg or "deadline" in msg or "504" in msg:
+    if isinstance(exc, anthropic.APITimeoutError):
         return "The summarizer took too long to respond. Please try again in a moment."
-    if "api key" in msg or "api_key" in msg or "permission" in msg or "401" in msg or "403" in msg:
+    if isinstance(exc, (anthropic.AuthenticationError, anthropic.PermissionDeniedError)):
         return "The summarizer is temporarily unavailable (configuration problem on our side). Please try again later."
-    if "429" in msg or "quota" in msg or "resource_exhausted" in msg:
+    if isinstance(exc, anthropic.RateLimitError):
         return "The summarizer is very busy right now. Please try again in a few minutes."
+    if isinstance(exc, anthropic.APIConnectionError):
+        return "The summarizer could not be reached. Please try again in a moment."
+    if isinstance(exc, RefusedError):
+        return "The summarizer could not process this text. Please try different text."
     return "Something went wrong while summarizing. Please try again later."
+
+
+class RefusedError(Exception):
+    pass
 
 
 def handle_request(user: str, text: str, style: str, failure_mode: str) -> None:
@@ -116,16 +121,18 @@ def handle_request(user: str, text: str, style: str, failure_mode: str) -> None:
     start = time.perf_counter()
     try:
         with st.spinner("Summarizing..."):
-            summary, usage = summarize(text, style, failure_mode)
-        if not summary:
-            raise ValueError("empty response from model")
-        if usage:
-            entry["input_tokens"] = usage.prompt_token_count or 0
-            # Thinking tokens are billed as output tokens.
-            entry["output_tokens"] = (usage.candidates_token_count or 0) + (usage.thoughts_token_count or 0)
+            response = summarize(text, style, failure_mode)
+        # Tokens are billed even if the model declines, so record them first.
+        entry["input_tokens"] = response.usage.input_tokens
+        entry["output_tokens"] = response.usage.output_tokens  # includes thinking tokens
         entry["est_cost_usd"] = round(
             entry["input_tokens"] / 1e6 * PRICE_IN + entry["output_tokens"] / 1e6 * PRICE_OUT, 6
         )
+        if response.stop_reason == "refusal":
+            raise RefusedError("model declined the request")
+        summary = "".join(block.text for block in response.content if block.type == "text")
+        if not summary:
+            raise ValueError("empty response from model")
         st.subheader("Summary")
         st.write(summary)
     except Exception as exc:  # never show a stack trace to the user
