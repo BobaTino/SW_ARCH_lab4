@@ -10,7 +10,7 @@ import streamlit as st
 from google import genai
 from google.genai import types
 
-# Config
+# ---------- Configuration (everything comes from environment variables) ----------
 API_KEY = os.environ.get("GEMINI_API_KEY", "")
 MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.8-flash")
 RATE_LIMIT = int(os.environ.get("RATE_LIMIT_PER_HOUR", "5"))  # requests per user per hour
@@ -24,7 +24,7 @@ LOG_FILE = Path(__file__).parent / "logs" / "requests.jsonl"
 WINDOW_SECONDS = 3600
 
 
-# Structure logging
+# ---------- Structured logging: one JSON object per line ----------
 def write_log(entry: dict) -> None:
     LOG_FILE.parent.mkdir(exist_ok=True)
     with LOG_FILE.open("a") as f:
@@ -37,7 +37,7 @@ def read_logs() -> list[dict]:
     return [json.loads(line) for line in LOG_FILE.read_text().splitlines() if line.strip()]
 
 
-# Rate Limiter 
+# ---------- Rate limiter: in-memory {user: [timestamps]} shared by all sessions ----------
 @st.cache_resource
 def request_history() -> dict[str, list[float]]:
     return {}
@@ -56,7 +56,7 @@ def check_rate_limit(user: str) -> tuple[bool, int]:
     return True, 0
 
 
-# LLM Call
+# ---------- The LLM call ----------
 def summarize(text: str, style: str, failure_mode: str):
     api_key, timeout = API_KEY, TIMEOUT_MS
     if failure_mode == "Revoked API key":
@@ -64,15 +64,23 @@ def summarize(text: str, style: str, failure_mode: str):
     elif failure_mode == "Timeout":
         timeout = 1  # 1 ms: guaranteed to time out
     client = genai.Client(api_key=api_key, http_options=types.HttpOptions(timeout=timeout))
-    return client.models.generate_content(
+    # Streaming keeps the connection active while the model works, which avoids
+    # most 504 DEADLINE_EXCEEDED errors on slower models.
+    text_parts, usage = [], None
+    for chunk in client.models.generate_content_stream(
         model=MODEL,
         contents=f"Summarize the following text as {style}.\n\n---\n{text}",
-    )
+    ):
+        if chunk.text:
+            text_parts.append(chunk.text)
+        if chunk.usage_metadata:
+            usage = chunk.usage_metadata
+    return "".join(text_parts), usage
 
 
 def friendly_error(exc: Exception) -> str:
     name, msg = type(exc).__name__.lower(), str(exc).lower()
-    if "timeout" in name or "timed out" in msg or "timeout" in msg:
+    if "timeout" in name or "timed out" in msg or "timeout" in msg or "deadline" in msg or "504" in msg:
         return "The summarizer took too long to respond. Please try again in a moment."
     if "api key" in msg or "api_key" in msg or "permission" in msg or "401" in msg or "403" in msg:
         return "The summarizer is temporarily unavailable (configuration problem on our side). Please try again later."
@@ -108,14 +116,13 @@ def handle_request(user: str, text: str, style: str, failure_mode: str) -> None:
     start = time.perf_counter()
     try:
         with st.spinner("Summarizing..."):
-            response = summarize(text, style, failure_mode)
-        summary = response.text
+            summary, usage = summarize(text, style, failure_mode)
         if not summary:
             raise ValueError("empty response from model")
-        usage = response.usage_metadata
-        entry["input_tokens"] = usage.prompt_token_count or 0
-        # Thinking tokens are billed as output tokens.
-        entry["output_tokens"] = (usage.candidates_token_count or 0) + (usage.thoughts_token_count or 0)
+        if usage:
+            entry["input_tokens"] = usage.prompt_token_count or 0
+            # Thinking tokens are billed as output tokens.
+            entry["output_tokens"] = (usage.candidates_token_count or 0) + (usage.thoughts_token_count or 0)
         entry["est_cost_usd"] = round(
             entry["input_tokens"] / 1e6 * PRICE_IN + entry["output_tokens"] / 1e6 * PRICE_OUT, 6
         )
@@ -130,7 +137,7 @@ def handle_request(user: str, text: str, style: str, failure_mode: str) -> None:
         write_log(entry)
 
 
-# Usage Report
+# ---------- Usage report ----------
 def percentile(values: list[float], pct: float) -> float:
     ordered = sorted(values)
     index = min(len(ordered) - 1, max(0, round(pct / 100 * len(ordered)) - 1))
@@ -170,7 +177,7 @@ def usage_page() -> None:
     st.download_button("Download raw log (JSONL)", LOG_FILE.read_bytes(), "requests.jsonl")
 
 
-# Summarizer Page
+# ---------- Summarizer page ----------
 def summarizer_page() -> None:
     st.title("Text Summarizer")
     st.caption(f"Paste any text and get a short summary. Limit: {RATE_LIMIT} summaries per hour.")
