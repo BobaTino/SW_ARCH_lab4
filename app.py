@@ -12,7 +12,7 @@ from google.genai import types
 
 # Config
 API_KEY = os.environ.get("GEMINI_API_KEY", "")
-MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
+MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.8-flash")
 RATE_LIMIT = int(os.environ.get("RATE_LIMIT_PER_HOUR", "5"))  # requests per user per hour
 TIMEOUT_MS = int(os.environ.get("REQUEST_TIMEOUT_MS", "30000"))
 MAX_INPUT_CHARS = 20_000
