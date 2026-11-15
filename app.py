@@ -14,7 +14,7 @@ from google.genai import types
 API_KEY = os.environ.get("GEMINI_API_KEY", "")
 MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.8-flash")
 RATE_LIMIT = int(os.environ.get("RATE_LIMIT_PER_HOUR", "5"))  # requests per user per hour
-TIMEOUT_MS = int(os.environ.get("REQUEST_TIMEOUT_MS", "30000"))
+TIMEOUT_MS = int(os.environ.get("REQUEST_TIMEOUT_MS", "120000"))
 MAX_INPUT_CHARS = 20_000
 # Estimated price in USD per 1 million tokens (adjust to match your model's pricing page).
 PRICE_IN = float(os.environ.get("PRICE_INPUT_PER_M", "0.30"))
